@@ -300,3 +300,11 @@ $("refreshBtn").addEventListener("click", async () => {
 });
 
 load();
+
+// 명암(다크/라이트) 전환
+$("themeBtn").addEventListener("click", () => {
+  const d = document.documentElement.classList.toggle("dark");
+  const m = document.querySelector('meta[name="theme-color"]');
+  if (m) m.content = d ? "#151a22" : "#f4f6fa";
+  try { localStorage.setItem("theme_v1", d ? "dark" : "light"); } catch (e) {}
+});
