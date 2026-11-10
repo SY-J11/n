@@ -682,30 +682,7 @@ $("themeBtn").addEventListener("click", () => {
 })();
 
 
-/* ===== 영향력 있는 인물 검색 ===== */
-
-const search=document.getElementById('history-search');
-const cards=[...document.querySelectorAll('.history-card')];
-const buttons=[...document.querySelectorAll('.history-filter')];
-let active='all';
-function update(){
- const q=search.value.trim().toLowerCase();let count=0;
- cards.forEach(card=>{
-  const text=(card.innerText+' '+card.dataset.search+' '+card.dataset.cat).toLowerCase();
-  const category=card.dataset.cat||'';
-  const matchText=!q||text.includes(q);
-  const matchCat=active==='all'||(active==='한국'?category.includes('한국'):active==='정책'?category.includes('정책'):category.includes(active));
-  card.style.display=matchText&&matchCat?'':'none';
-  if(matchText&&matchCat)count++;
- });
- document.getElementById('history-empty').style.display=count?'none':'block';
-}
-search.addEventListener('input',update);
-buttons.forEach(btn=>btn.addEventListener('click',()=>{
- active=btn.dataset.filter;buttons.forEach(b=>b.classList.toggle('history-active',b===btn));update();
-}));
-
-
+/* 인물 이름은 네이버 검색 링크로 직접 연결됩니다. */
 
 /* ===== 글로벌 시각 항목 추가·삭제·복원 ===== */
 (() => {
@@ -717,49 +694,98 @@ buttons.forEach(btn=>btn.addEventListener('click',()=>{
   const cancelBtn = document.getElementById("cancelGlobalItemBtn");
   const form = document.getElementById("globalItemForm");
   const deletedList = document.getElementById("deletedGlobalItems");
-  let deleteMode = false;
-  let deleted = [];
-  let added = [];
+  const groupsContainer = root.querySelector(".global-perspective-groups");
+  let deleteMode = false, deleted = [], added = [];
   try {
     const saved = JSON.parse(localStorage.getItem(storageKey) || "{}");
     deleted = Array.isArray(saved.deleted) ? saved.deleted : [];
     added = Array.isArray(saved.added) ? saved.added : [];
-    // Remove the unwanted J.P.Morgan search card from the Korea's Stock Market set.
-    added = added.filter(item => !(String(item.market || "").trim() === "Korea's Stock Market" && /J\.?P\.?\s*Morgan/i.test(item.html || "")));
+    // 이전 버전의 카드 단위 저장값은 그룹으로 묶어 호환한다.
+    const legacy = added.filter(x => !x.type || x.type !== "group");
+    added = added.filter(x => x.type === "group");
+    legacy.forEach((x, i) => {
+      const market = x.market || "추가 항목";
+      let group = added.find(g => g.market === market);
+      if (!group) { group = {type:"group", id:"legacy-" + i, market, cards:[]}; added.push(group); }
+      group.cards.push(x.html);
+    });
   } catch (_) {}
   const save = () => localStorage.setItem(storageKey, JSON.stringify({deleted, added}));
-  const groupsContainer = root.querySelector(".global-perspective-groups");
   const groups = () => [...root.querySelectorAll(".global-market-group")];
-  const createPeerGroup = (name) => {
+  const marketName = group => group.querySelector(".global-market-heading h2")?.textContent.trim() || "추가 항목";
+  const createPeerGroup = (name, id) => {
     const group = document.createElement("section");
     group.className = "global-market-group card custom-global-group";
+    if (id) group.dataset.groupId = id;
     const heading = document.createElement("div"); heading.className = "global-market-heading";
     heading.innerHTML = '<span class="eyebrow">GLOBAL MARKET WATCH · CUSTOM</span>';
     const h2 = document.createElement("h2"); h2.textContent = name; heading.appendChild(h2);
     const grid = document.createElement("div"); grid.className = "global-market-grid";
-    group.append(heading, grid); groupsContainer.appendChild(group); return group;
+    group.append(heading, grid); groupsContainer.appendChild(group);
+    return group;
   };
-  const marketName = card => card.closest(".global-market-group")?.querySelector(".global-market-heading h2")?.textContent.trim() || "";
-  const cardData = card => ({
-    html: card.outerHTML,
-    market: marketName(card),
-    deletedAt: Date.now()
-  });
+  const providers = [
+    {name:"Google", source:"global", domain:"news.google.com"},
+    {name:"Goldman Sachs", source:"official-goldman", domain:"goldmansachs.com"},
+    {name:"Morgan Stanley", source:"official-morgan", domain:"morganstanley.com"}
+  ];
+  const makeCard = (query, provider, id) => {
+    const card = document.createElement("section");
+    card.className = "person-news global-news-card";
+    card.dataset.query = query; card.dataset.source = provider.source;
+    card.dataset.customId = id;
+    const link = provider.source === "global"
+      ? "https://news.google.com/search?q=" + encodeURIComponent(query) + "&hl=en-US&gl=US&ceid=US:en"
+      : provider.source === "official-goldman"
+        ? "https://www.goldmansachs.com/search?query=" + encodeURIComponent(query)
+        : "https://www.morganstanley.com/search?text=" + encodeURIComponent(query);
+    card.innerHTML = `<div class="person-news-head"><b></b><span class="person-news-actions"><a class="person-news-search-link" href="${link}" target="_blank" rel="noopener noreferrer">전체 기사 보기 ↗</a><span>최신순</span></span></div><div class="person-news-list"><div class="person-news-state">화면에 표시되면 검색 결과를 불러옵니다.</div></div><button type="button" class="person-news-more" data-news-more disabled>기사 10개 더 보기</button>`;
+    const b = card.querySelector(".person-news-head>b"); b.textContent = provider.name;
+    if (provider.domain !== "news.google.com") {
+      b.classList.add("provider-brand"); const img = document.createElement("img");
+      img.src = "https://www.google.com/s2/favicons?domain=" + provider.domain + "&sz=64";
+      img.alt = ""; img.loading = "lazy"; b.prepend(img);
+    }
+    return card;
+  };
+  async function loadAddedCard(card) {
+    if (!card || card.dataset.loaded === "1") return;
+    card.dataset.loaded = "1";
+    const list = card.querySelector(".person-news-list"), more = card.querySelector("[data-news-more]");
+    try {
+      const response = await fetch("https://macro.mcraft-tiger-574.workers.dev/api/person-news?q=" +
+        encodeURIComponent(card.dataset.query || "") + "&source=" + encodeURIComponent(card.dataset.source || "global") + "&limit=10&offset=0");
+      const data = await response.json(); if (!response.ok) throw new Error(data.error || "검색 요청 실패");
+      const items = Array.isArray(data.items) ? data.items : [];
+      list.innerHTML = items.map((item, i) =>
+        `<a class="person-news-item" href="${esc(item.url)}" target="_blank" rel="noopener noreferrer"><span class="person-news-number">${i+1}</span><span class="person-news-copy"><b>${esc(item.title)}</b><small>${esc(item.source || data.provider || "검색 결과")}</small></span><span class="person-news-arrow">↗</span></a>`
+      ).join("") || `<div class="person-news-state">${esc(data.error || "검색 결과가 없습니다.")}</div>`;
+      if (more) more.hidden = true;
+    } catch (error) { list.innerHTML = `<div class="person-news-state">검색 결과를 불러오지 못했습니다: ${esc(error.message || error)}</div>`; card.dataset.loaded = "0"; }
+  }
+  const renderGroup = (record, shouldLoad = true) => {
+    const group = createPeerGroup(record.market, record.id);
+    const grid = group.querySelector(".global-market-grid");
+    const cards = record.cards?.length ? record.cards : providers.map((p, i) => makeCard(record.market, p, record.id + "-" + i).outerHTML);
+    cards.forEach((html, i) => {
+      const holder = document.createElement("div"); holder.innerHTML = html;
+      const card = holder.firstElementChild; if (!card) return;
+      card.dataset.customId = record.id + "-" + i; grid.appendChild(card);
+      if (shouldLoad) loadAddedCard(card);
+    });
+    return group;
+  };
   const ensureDeleteControls = () => {
     root.querySelectorAll(".global-market-group.custom-global-group").forEach(group => {
       let btn = group.querySelector(":scope > .global-group-delete");
       if (deleteMode && !btn) {
-        btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "global-group-delete";
-        btn.textContent = "항목 세트 삭제";
+        btn = document.createElement("button"); btn.type = "button"; btn.className = "global-group-delete";
+        btn.textContent = "삭제";
         btn.addEventListener("click", () => {
-          const ids = [...group.querySelectorAll(".global-news-card")].map(card => card.dataset.customId).filter(Boolean);
-          deleted.push({type:"group", html:group.outerHTML, market:marketName(group.querySelector(".global-news-card") || group), deletedAt:Date.now()});
-          added = added.filter(item => !ids.includes(item.id));
-          save();
-          group.remove();
-          renderDeleted();
+          const id = group.dataset.groupId;
+          const record = added.find(x => x.id === id);
+          deleted.push({type:"group", id, market:marketName(group), html:group.outerHTML, deletedAt:Date.now()});
+          added = added.filter(x => x.id !== id); save(); group.remove(); renderDeleted();
         });
         group.appendChild(btn);
       } else if (!deleteMode && btn) btn.remove();
@@ -767,151 +793,55 @@ buttons.forEach(btn=>btn.addEventListener('click',()=>{
   };
   function renderDeleted() {
     deletedList.innerHTML = "";
-    if (!deleted.length) {
-      deletedList.innerHTML = "<p>복원할 항목이 없습니다.</p>";
-      return;
-    }
+    if (!deleted.length) { deletedList.innerHTML = "<p>복원할 항목이 없습니다.</p>"; return; }
     deleted.forEach((item, index) => {
-      const row = document.createElement("div");
-      row.className = "global-deleted-row";
-      const label = document.createElement("span");
-      const temp = document.createElement("div");
-      temp.innerHTML = item.html || "";
-      label.textContent = `${item.market || "시장"} · ${temp.querySelector(".person-news-head b")?.textContent || "검색 항목"}`;
-      const restore = document.createElement("button");
-      restore.type = "button";
-      restore.className = "people-manage-btn";
-      restore.textContent = "복원";
+      const row = document.createElement("div"); row.className = "global-deleted-row";
+      const label = document.createElement("span"); label.textContent = item.market || "추가 항목";
+      const restore = document.createElement("button"); restore.type = "button"; restore.className = "people-manage-btn"; restore.textContent = "복원";
       restore.addEventListener("click", () => {
-        const holder = document.createElement("div");
-        holder.innerHTML = item.html || "";
+        const holder = document.createElement("div"); holder.innerHTML = item.html || "";
         const restored = holder.firstElementChild;
-        if (restored && item.type === "group") {
-          restored.querySelector(".global-group-delete")?.remove();
+        if (restored) {
+          restored.querySelector(":scope > .global-group-delete")?.remove();
+          restored.classList.add("custom-global-group"); restored.dataset.groupId = item.id || ("restored-" + Date.now().toString(36));
           groupsContainer.appendChild(restored);
           restored.querySelectorAll(".global-news-card").forEach(loadAddedCard);
+          const cards = [...restored.querySelectorAll(".global-news-card")].map(c => c.outerHTML);
+          added.push({type:"group", id:restored.dataset.groupId, market:item.market || marketName(restored), cards});
           if (deleteMode) ensureDeleteControls();
-        } else if (restored) {
-          const group = createPeerGroup(item.market || "추가 항목");
-          const grid = group.querySelector(".global-market-grid");
-          restored.querySelector(".global-item-delete")?.remove();
-          grid.appendChild(restored);
-          if (deleteMode) ensureDeleteControls();
-          loadAddedCard(restored);
         }
-        deleted.splice(index, 1);
-        save();
-        renderDeleted();
+        deleted.splice(index, 1); save(); renderDeleted();
       });
-      row.append(label, restore);
-      deletedList.appendChild(row);
+      const permanent = document.createElement("button"); permanent.type = "button"; permanent.className = "people-manage-btn danger"; permanent.textContent = "삭제";
+      permanent.addEventListener("click", () => { deleted.splice(index, 1); save(); renderDeleted(); });
+      const actions = document.createElement("div"); actions.className = "global-deleted-actions";
+      actions.append(restore, permanent);
+      row.append(label, actions); deletedList.appendChild(row);
     });
   }
-  // 사용자 추가 항목 복원
-  added.forEach(item => {
-    const group = createPeerGroup(item.market || "추가 항목");
-    const grid = group.querySelector(".global-market-grid");
-    if (!grid || grid.querySelector(`[data-custom-id="${item.id}"]`)) return;
-    const holder = document.createElement("div");
-    holder.innerHTML = item.html;
-    if (holder.firstElementChild) {
-      grid.appendChild(holder.firstElementChild);
-      loadAddedCard(holder.firstElementChild);
-    }
-  });
+  // Render persisted custom groups as complete, three-card sets.
+  added.forEach(record => renderGroup(record));
   addBtn?.addEventListener("click", () => {
-    form.hidden = false;
-    cancelBtn.hidden = false;
-    addBtn.hidden = true;
+    form.hidden = false; cancelBtn.hidden = false; addBtn.hidden = true;
     form.scrollIntoView({behavior:"smooth", block:"center"});
+    form.querySelector('input[name="market"]')?.focus();
   });
-  cancelBtn?.addEventListener("click", () => {
-    form.reset(); form.hidden = true; cancelBtn.hidden = true; addBtn.hidden = false;
-  });
+  cancelBtn?.addEventListener("click", () => { form.reset(); form.hidden = true; cancelBtn.hidden = true; addBtn.hidden = false; });
   deleteBtn?.addEventListener("click", () => {
-    deleteMode = !deleteMode;
-    deleteBtn.classList.toggle("active", deleteMode);
+    deleteMode = !deleteMode; deleteBtn.classList.toggle("active", deleteMode);
     deleteBtn.setAttribute("aria-pressed", String(deleteMode));
-    deleteBtn.textContent = deleteMode ? "삭제 선택 종료" : "－ 항목 삭제";
-    ensureDeleteControls();
+    deleteBtn.textContent = deleteMode ? "삭제 선택 종료" : "－ 항목 삭제"; ensureDeleteControls();
   });
-  async function loadAddedCard(card) {
-    if (!card || card.dataset.loaded === "1") return;
-    card.dataset.loaded = "1";
-    const list = card.querySelector(".person-news-list");
-    const more = card.querySelector("[data-news-more]");
-    const q = card.dataset.query || "";
-    const src = card.dataset.source || "global";
-    try {
-      const response = await fetch("https://macro.mcraft-tiger-574.workers.dev/api/person-news?q=" +
-        encodeURIComponent(q) + "&source=" + encodeURIComponent(src) + "&limit=10&offset=0");
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "검색 요청 실패");
-      const items = Array.isArray(data.items) ? data.items : [];
-      list.innerHTML = items.map((item, i) =>
-        `<a class="person-news-item" href="${esc(item.url)}" target="_blank" rel="noopener noreferrer"><span class="person-news-number">${i+1}</span><span class="person-news-copy"><b>${esc(item.title)}</b><small>${esc(item.source || data.provider || "검색 결과")}</small></span><span class="person-news-arrow">↗</span></a>`
-      ).join("") || `<div class="person-news-state">${esc(data.error || "검색 결과가 없습니다.")}</div>`;
-      if (more) more.hidden = true;
-    } catch (error) {
-      list.innerHTML = `<div class="person-news-state">검색 결과를 불러오지 못했습니다: ${esc(error.message || error)}</div>`;
-      card.dataset.loaded = "0";
-    }
-  }
   form?.addEventListener("submit", event => {
-    event.preventDefault();
-    const data = new FormData(form);
-    const market = String(data.get("market") || "KOSPI");
-    const provider = String(data.get("provider") || "").trim();
-    const query = String(data.get("query") || "").trim();
-    const rawSearchUrl = String(data.get("searchUrl") || "").trim();
-    if (!provider || !query) return;
+    event.preventDefault(); const market = String(new FormData(form).get("market") || "").trim();
+    if (!market) return;
     const id = "custom-" + Date.now().toString(36);
-    let source = "global";
-    let searchUrl = rawSearchUrl;
-    if (rawSearchUrl) {
-      try {
-        const u = new URL(rawSearchUrl.replace("{query}", encodeURIComponent(query)));
-        if (u.hostname.endsWith("goldmansachs.com")) source = "official-goldman";
-        else if (u.hostname.endsWith("morganstanley.com")) source = "official-morgan";
-        else source = "global";
-        searchUrl = u.href;
-      } catch (_) { alert("검색 URL 형식을 확인해 주세요."); return; }
-    }
-    const groupName = market;
-    const group = createPeerGroup(groupName);
-    const grid = group.querySelector(".global-market-grid");
-    const card = document.createElement("section");
-    card.className = "person-news global-news-card";
-    card.dataset.query = query;
-    card.dataset.source = source;
-    card.dataset.customId = id;
-    card.innerHTML = `<div class="person-news-head"><b></b><span class="person-news-actions"><a class="person-news-search-link" target="_blank" rel="noopener noreferrer">공식 검색 보기 ↗</a><span>최신순</span></span></div><div class="person-news-list"><div class="person-news-state">화면에 표시되면 검색 결과를 불러옵니다.</div></div><button type="button" class="person-news-more" data-news-more disabled>기사 10개 더 보기</button>`;
-    const normalizedProvider = /j\.?\s*p\.?\s*morgan|jpmorgan/i.test(provider) ? "J.P.Morgan"
-      : /goldman/i.test(provider) ? "Goldman Sachs"
-      : /morgan\s*stanley/i.test(provider) ? "Morgan Stanley" : provider;
-    const providerHeading = card.querySelector(".person-news-head>b");
-    providerHeading.textContent = normalizedProvider;
-    const logoDomain = /goldman/i.test(normalizedProvider) ? "goldmansachs.com"
-      : /morgan stanley/i.test(normalizedProvider) ? "morganstanley.com" : "";
-    if (logoDomain) {
-      providerHeading.classList.add("provider-brand");
-      const logo = document.createElement("img");
-      logo.src = "https://www.google.com/s2/favicons?domain=" + logoDomain + "&sz=64";
-      logo.alt = ""; logo.loading = "lazy";
-      providerHeading.prepend(logo);
-    }
-    const link = card.querySelector(".person-news-search-link");
-    if (searchUrl) link.href = searchUrl;
-    else link.href = "https://www.google.com/search?q=" + encodeURIComponent(query + " " + provider);
-    grid.appendChild(card);
-    added.push({id, market, html:card.outerHTML});
-    save();
+    const record = {type:"group", id, market, cards:providers.map((p, i) => makeCard(market, p, id + "-" + i).outerHTML)};
+    added.push(record); const group = renderGroup(record); save();
     form.reset(); form.hidden = true; cancelBtn.hidden = true; addBtn.hidden = false;
-    ensureDeleteControls();
-    loadAddedCard(card);
+    ensureDeleteControls(); group.scrollIntoView({behavior:"smooth", block:"start"});
   });
-  renderDeleted();
-  ensureDeleteControls();
+  renderDeleted(); ensureDeleteControls();
 })();
 
 /* Remove stray template marker text from rendered page content. */
