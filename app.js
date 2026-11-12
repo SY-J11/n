@@ -224,12 +224,13 @@ async function load() {
       ? `최근 업데이트 ${dateText(data.briefing.updatedAt)}`
       : "데이터 연결 완료";
 
-    $("dateLabel").textContent = new Date().toLocaleDateString("ko-KR", {
+    $("dateLabel").textContent = new Intl.DateTimeFormat("ko-KR", {
+      timeZone: "Asia/Seoul",
       year: "numeric",
       month: "long",
       day: "numeric",
       weekday: "short"
-    });
+    }).format(new Date());
 
     renderNews();
     renderIssues();
@@ -439,12 +440,44 @@ $("themeBtn").addEventListener("click", () => {
   const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
   const loadedNews = new Set();
   const loadingNews = new Set();
+  // 같은 검색어/페이지는 60초 동안 재사용하고, 동시에 발생한 중복 요청은 하나로 합칩니다.
+  const personNewsClientCache = new Map();
+  const personNewsInFlight = new Map();
   const newsOffsets = new WeakMap();
   const newsItems = new WeakMap();
   const newsProviders = new WeakMap();
   const newsVisibleCounts = new WeakMap();
   const newsHasMore = new WeakMap();
+  const newsExpanded = new WeakSet();
   const truthState = { items: [], shown: 0, loading: false, loaded: false };
+  // 날짜는 대시보드 데이터 로딩 여부와 관계없이 항상 한국시간으로 표시합니다.
+  const updateKoreaDate = () => {
+    const dateLabel = document.getElementById("dateLabel");
+    if (!dateLabel) return;
+    const now = new Date();
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit", weekday: "short"
+    }).formatToParts(now).reduce((out, part) => (out[part.type] = part.value, out), {});
+    const key = `${parts.year}-${parts.month}-${parts.day}`;
+    // 대한민국 주요 법정공휴일 및 설·추석 연휴(대체공휴일 포함)
+    const koreanHolidays = new Set([
+      "2025-01-01","2025-01-28","2025-01-29","2025-01-30","2025-03-01","2025-03-03","2025-05-05","2025-05-06","2025-06-06","2025-08-15","2025-10-03","2025-10-05","2025-10-06","2025-10-07","2025-10-08","2025-10-09","2025-12-25",
+      "2026-01-01","2026-05-01","2026-02-16","2026-02-17","2026-02-18","2026-03-01","2026-03-02","2026-05-05","2026-05-24","2026-05-25","2026-06-06","2026-08-15","2026-08-17","2026-09-24","2026-09-25","2026-09-26","2026-10-03","2026-10-05","2026-10-09","2026-12-25",
+      "2027-01-01","2027-05-01","2027-02-05","2027-02-06","2027-02-07","2027-03-01","2027-05-05","2027-05-13","2027-06-06","2027-08-15","2027-09-14","2027-09-15","2027-09-16","2027-10-03","2027-10-04","2027-10-09","2027-12-25",
+      "2028-01-01","2028-05-01","2028-01-25","2028-01-26","2028-01-27","2028-03-01","2028-05-02","2028-05-05","2028-06-06","2028-08-15","2028-10-02","2028-10-03","2028-10-04","2028-10-09","2028-12-25",
+      "2029-01-01","2029-05-01","2029-02-12","2029-02-13","2029-02-14","2029-03-01","2029-05-05","2029-05-07","2029-06-06","2029-08-15","2029-09-21","2029-09-22","2029-09-23","2029-10-03","2029-10-09","2029-12-25",
+      "2030-01-01","2030-05-01","2030-02-02","2030-02-03","2030-02-04","2030-03-01","2030-05-05","2030-05-06","2030-06-06","2030-08-15","2030-09-11","2030-09-12","2030-09-13","2030-10-03","2030-10-09","2030-12-25"
+    ]);
+    const weekday = parts.weekday;
+    const isSunday = weekday === "Sun";
+    const isSaturday = weekday === "Sat";
+    dateLabel.classList.remove("date-holiday", "date-saturday", "date-weekday");
+    dateLabel.classList.add(koreanHolidays.has(key) || isSunday ? "date-holiday" : isSaturday ? "date-saturday" : "date-weekday");
+    dateLabel.textContent = new Intl.DateTimeFormat("ko-KR", {
+      timeZone: "Asia/Seoul", year: "numeric", month: "long", day: "numeric", weekday: "short"
+    }).format(now);
+  };
+  updateKoreaDate();
   const restoreRoot = document.getElementById("deletedPeopleList");
   const fmtDate = value => new Date(value).toLocaleString("ko-KR", {year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"});
   function renderDeleted(){
@@ -581,12 +614,48 @@ $("themeBtn").addEventListener("click", () => {
       const state=document.createElement('div');state.className='person-news-state';state.textContent='최근 기사를 찾지 못했습니다.';list.appendChild(state);
     }
     if(more){
-      const hasHiddenItems=visible.length<items.length;
-      const canFetchMore=newsHasMore.get(section)!==false;
-      more.hidden=!hasHiddenItems&&!canFetchMore&&loadedNews.has(section);
-      more.disabled=loadingNews.has(section)||!loadedNews.has(section)||(!hasHiddenItems&&!canFetchMore);
-      more.textContent='기사 10개 더 보기';
+      if(newsExpanded.has(section)){
+        more.hidden=false;
+        more.disabled=false;
+        more.textContent='전체 기사 검색';
+        more.setAttribute('data-news-all', '');
+      } else {
+        more.removeAttribute('data-news-all');
+        const hasHiddenItems=visible.length<items.length;
+        const canFetchMore=newsHasMore.get(section)!==false;
+        // 결과가 적거나 서버가 hasMore=false를 반환해도 버튼을 숨기지 않습니다.
+        // 첫 클릭은 현재 확보된 기사를 펼치고, 이후에는 전체 검색 결과 버튼으로 전환합니다.
+        more.hidden=false;
+        more.disabled=loadingNews.has(section)||!loadedNews.has(section);
+        more.textContent='기사 10개 더 보기';
+      }
     }
+  }
+
+  async function fetchPersonNewsData(url, cacheKey){
+    const now=Date.now();
+    const cached=personNewsClientCache.get(cacheKey);
+    if(cached && cached.expiresAt>now) return cached.data;
+    if(cached) personNewsClientCache.delete(cacheKey);
+    if(personNewsInFlight.has(cacheKey)) return personNewsInFlight.get(cacheKey);
+    const task=(async()=>{
+      const controller=new AbortController();
+      const timeout=setTimeout(()=>controller.abort(),12000);
+      try{
+        const response=await fetch(url,{signal:controller.signal,headers:{'Accept':'application/json'},cache:'force-cache'});
+        const data=await response.json();
+        if(!response.ok) throw new Error(data.error||('뉴스 서버 응답 오류 (HTTP '+response.status+')'));
+        if(data.error && (!Array.isArray(data.items)||!data.items.length)) throw new Error(data.error);
+        personNewsClientCache.set(cacheKey,{data,expiresAt:Date.now()+60000});
+        if(personNewsClientCache.size>120){
+          for(const [key,value] of personNewsClientCache){if(value.expiresAt<=Date.now()) personNewsClientCache.delete(key);}
+          while(personNewsClientCache.size>120) personNewsClientCache.delete(personNewsClientCache.keys().next().value);
+        }
+        return data;
+      } finally {clearTimeout(timeout);}
+    })();
+    personNewsInFlight.set(cacheKey,task);
+    try{return await task;}finally{if(personNewsInFlight.get(cacheKey)===task) personNewsInFlight.delete(cacheKey);}
   }
 
   async function loadNews(section){
@@ -601,15 +670,10 @@ $("themeBtn").addEventListener("click", () => {
     let requestSucceeded=false;
     try{
       const source=section.dataset.source||'global';
-      const url='https://macro.mcraft-tiger-574.workers.dev/api/person-news?q='+encodeURIComponent(section.dataset.query)+'&source='+encodeURIComponent(source)+'&limit=10&offset='+offset;
-      const controller=new AbortController();
-      const timeout=setTimeout(()=>controller.abort(),12000);
-      let response;
-      try { response=await fetch(url,{signal:controller.signal,headers:{'Accept':'application/json'},cache:'force-cache'}); }
-      finally { clearTimeout(timeout); }
-      const data=await response.json();
-      if(!response.ok) throw new Error(data.error||('뉴스 서버 응답 오류 (HTTP '+response.status+')'));
-      if(data.error && (!Array.isArray(data.items)||!data.items.length)) throw new Error(data.error);
+      const query=String(section.dataset.query||'').trim();
+      const url='https://macro.mcraft-tiger-574.workers.dev/api/person-news?q='+encodeURIComponent(query)+'&source='+encodeURIComponent(source)+'&limit=10&offset='+offset;
+      const requestKey=source+'|'+query.toLocaleLowerCase()+'|10|'+offset;
+      const data=await fetchPersonNewsData(url,requestKey);
       const incoming=Array.isArray(data.items)?data.items:[];
       if(data.provider && !newsProviders.has(section)) newsProviders.set(section,data.provider);
       const existing=newsItems.get(section)||[];
@@ -669,14 +733,42 @@ $("themeBtn").addEventListener("click", () => {
       if (!button) return;
       const section = button.closest('.person-news');
       if (!section || loadingNews.has(section) || !loadedNews.has(section)) return;
+      if (newsExpanded.has(section)) {
+        const source=section.dataset.source||'global';
+        const query=section.dataset.query||'';
+        let href;
+        if(source==='official-goldman') href='https://www.goldmansachs.com/search?query='+encodeURIComponent(query);
+        else if(source==='official-morgan') href='https://www.morganstanley.com/search?text='+encodeURIComponent(query);
+        else if(source==='naver') href='https://search.naver.com/search.naver?where=news&query='+encodeURIComponent(query)+'&sort=1';
+        else href='https://news.google.com/search?q='+encodeURIComponent(query)+'&hl=en-US&gl=US&ceid=US%3Aen';
+        window.open(href, '_blank', 'noopener,noreferrer');
+        return;
+      }
       const currentVisible = newsVisibleCounts.get(section) || 3;
       const targetVisible = currentVisible + 10;
-      newsVisibleCounts.set(section, targetVisible);
       const items = newsItems.get(section) || [];
+      // 확보된 기사가 부족하면 다음 offset을 먼저 가져온 뒤 펼친다.
+      // 요청 중 중복 클릭을 막고, 새 기사가 도착하면 최대 10개를 추가 노출한다.
       if (items.length < targetVisible && newsHasMore.get(section) !== false) {
-        renderNewsItems(section);
-        loadNews(section);
+        newsVisibleCounts.set(section, targetVisible);
+        (async () => {
+          // 한 번의 응답이 10개 미만이어도 목표 노출 수(기본 3개 + 10개)에
+          // 도달하거나 서버가 더 이상 결과가 없다고 할 때까지 다음 페이지를 이어 받습니다.
+          while ((newsItems.get(section) || []).length < targetVisible &&
+                 newsHasMore.get(section) !== false &&
+                 !loadingNews.has(section)) {
+            const before = (newsItems.get(section) || []).length;
+            await loadNews(section);
+            const after = (newsItems.get(section) || []).length;
+            if (after <= before) break;
+          }
+          newsVisibleCounts.set(section, Math.min(targetVisible, (newsItems.get(section) || []).length));
+          newsExpanded.add(section);
+          renderNewsItems(section);
+        })();
       } else {
+        newsVisibleCounts.set(section, Math.min(targetVisible, items.length));
+        newsExpanded.add(section);
         renderNewsItems(section);
       }
     });
